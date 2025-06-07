@@ -8,12 +8,6 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"github.com/1pkg/gohalt"
-	"github.com/IBM/sarama"
-	"github.com/rs/zerolog/log"
-	"github.com/telekom/pubsub-horizon-go/message"
-	"github.com/telekom/pubsub-horizon-go/resource"
-	"github.com/telekom/pubsub-horizon-go/tracing"
 	"net"
 	"pubsub-horizon-golaris/internal/cache"
 	"pubsub-horizon-golaris/internal/config"
@@ -21,10 +15,16 @@ import (
 	"pubsub-horizon-golaris/internal/mongo"
 	"strings"
 	"time"
+
+	"github.com/1pkg/gohalt"
+	"github.com/IBM/sarama"
+	"github.com/rs/zerolog/log"
+	"github.com/telekom/pubsub-horizon-go/message"
+	"github.com/telekom/pubsub-horizon-go/resource"
+	"github.com/telekom/pubsub-horizon-go/tracing"
 )
 
 var republishPendingEventsFunc = RepublishPendingEvents
-var throttler gohalt.Throttler
 
 // register the data type RepublishingCacheEntry to gob for encoding and decoding of binary data
 func init() {
@@ -36,8 +36,22 @@ func createThrottler(redeliveriesPerSecond int, deliveryType string) gohalt.Thro
 		return gohalt.NewThrottlerEcho(nil)
 	}
 
-	log.Info().Msgf("Creating throttler with %d redeliveries", redeliveriesPerSecond)
+	log.Info().Msgf("Creating throttler with %d redeliveries per second", redeliveriesPerSecond)
 	return gohalt.NewThrottlerTimed(uint64(redeliveriesPerSecond), config.Current.Republishing.ThrottlingIntervalTime, 0)
+}
+
+// validateThrottlingConfig validates the throttling configuration for a subscription
+func validateThrottlingConfig(subscription *resource.SubscriptionResource) error {
+	redeliveriesPerSecond := subscription.Spec.Subscription.RedeliveriesPerSecond
+	deliveryType := string(subscription.Spec.Subscription.DeliveryType)
+
+	// For non-SSE delivery types, redeliveriesPerSecond should be positive
+	if deliveryType != "sse" && deliveryType != "server_sent_event" && redeliveriesPerSecond <= 0 {
+		log.Warn().Msgf("Invalid redeliveriesPerSecond (%d) for subscription %s with delivery type %s. Throttling will be disabled.",
+			redeliveriesPerSecond, subscription.Spec.Subscription.SubscriptionId, deliveryType)
+	}
+
+	return nil
 }
 
 // HandleRepublishingEntry manages the republishing process for a given subscription.
@@ -91,7 +105,8 @@ func HandleRepublishingEntry(subscription *resource.SubscriptionResource) {
 
 	err = republishPendingEventsFunc(subscription, castedRepublishCacheEntry)
 	if err != nil {
-		log.Error().Err(err).Msgf("Error while republishing pending events for subscriptionId %s. Discarding rebublishing cache entry", subscriptionId)
+		log.Error().Err(err).Msgf("Error while republishing pending events for subscriptionId %s. Discarding republishing cache entry",
+			subscriptionId)
 		return
 	}
 
@@ -111,6 +126,12 @@ func RepublishPendingEvents(subscription *resource.SubscriptionResource, republi
 	var subscriptionId = subscription.Spec.Subscription.SubscriptionId
 	log.Info().Msgf("Republishing pending events for subscription %s", subscriptionId)
 
+	// Validate throttling configuration
+	if err := validateThrottlingConfig(subscription); err != nil {
+		log.Error().Err(err).Msgf("Invalid throttling configuration for subscription %s", subscriptionId)
+		return err
+	}
+
 	picker, err := kafka.NewPicker()
 
 	// Returning an error results in NOT deleting the republishingEntry from the cache
@@ -125,8 +146,10 @@ func RepublishPendingEvents(subscription *resource.SubscriptionResource, republi
 
 	batchSize := config.Current.Republishing.BatchSize
 
-	throttler = createThrottler(subscription.Spec.Subscription.RedeliveriesPerSecond, string(subscription.Spec.Subscription.DeliveryType))
-	defer throttler.Release(context.Background())
+	// Create throttler for this specific subscription (not global)
+	subscriptionThrottler := createThrottler(subscription.Spec.Subscription.RedeliveriesPerSecond,
+		string(subscription.Spec.Subscription.DeliveryType))
+	defer subscriptionThrottler.Release(context.Background())
 
 	cache.SetCancelStatus(subscriptionId, false)
 
@@ -134,7 +157,6 @@ func RepublishPendingEvents(subscription *resource.SubscriptionResource, republi
 	for {
 		if cache.GetCancelStatus(subscriptionId) {
 			log.Info().Msgf("Republishing for subscription %s has been cancelled", subscriptionId)
-
 			return nil
 		}
 
@@ -162,27 +184,25 @@ func RepublishPendingEvents(subscription *resource.SubscriptionResource, republi
 		}
 
 		for _, dbMessage := range dbMessages {
-
 			if cache.GetCancelStatus(subscriptionId) {
 				log.Info().Msgf("Republishing for subscription %s has been cancelled", subscriptionId)
 				return nil
 			}
 
+			// Fixed throttling logic - more efficient and proper handling
 			for {
-				if acquireResult := throttler.Acquire(context.Background()); acquireResult != nil {
-					sleepInterval := time.Millisecond * 10
-					totalSleepTime := config.Current.Republishing.ThrottlingIntervalTime
-					for slept := time.Duration(0); slept < totalSleepTime; slept += sleepInterval {
-						if cache.GetCancelStatus(subscriptionId) {
-							log.Info().Msgf("Republishing for subscription %s has been cancelled", subscriptionId)
-							return nil
-						}
-
-						time.Sleep(sleepInterval)
-					}
-					continue
+				if err := subscriptionThrottler.Acquire(context.Background()); err == nil {
+					break
 				}
-				break
+
+				// Check for cancellation during throttling wait
+				if cache.GetCancelStatus(subscriptionId) {
+					log.Info().Msgf("Republishing for subscription %s has been cancelled during throttling", subscriptionId)
+					return nil
+				}
+
+				// Short sleep before retrying throttle acquisition
+				time.Sleep(time.Millisecond * 10)
 			}
 
 			var newDeliveryType string
